@@ -1,0 +1,22 @@
+server:
+  http_listen_port: 9081
+  grpc_listen_port: 0
+
+positions:
+  filename: 'C:\loki\positions.yaml'
+
+clients:
+  - url: "http://jam-grafana-01:3100/loki/api/v1/push"
+
+scrape_configs:
+  - job_name: windows-sysmon
+    windows_events:
+      use_incoming_timestamp: true
+      bookmark_path: "C:/loki/bookmark-sysmon.xml"
+      eventlog_name: "Microsoft-Windows-Sysmon/Operational"
+      xpath_query: '*'
+      locale: 1033
+      labels:
+        job: windows-sysmon
+        host: ${COMPUTERNAME}
+        source: sysmon
