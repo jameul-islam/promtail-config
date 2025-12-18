@@ -1,0 +1,50 @@
+$ErrorActionPreference = "Stop"
+
+Write-Host "`n=== PATHS / FILES ==="
+$paths = @(
+  "C:\loki",
+  "C:\loki\bin",
+  "C:\loki\logs",
+  "C:\loki\promtail-config.yaml",
+  "C:\loki\bin\promtail.exe"
+)
+
+$paths | ForEach-Object {
+  "{0,-35} {1}" -f $_, (Test-Path $_)
+}
+
+Write-Host "`n=== SERVICES ==="
+Get-Service Sysmon64 -ErrorAction SilentlyContinue | Format-Table -AutoSize
+Get-Service Promtail -ErrorAction SilentlyContinue | Format-Table -AutoSize
+
+Write-Host "`n=== PROMTAIL SERVICE ARGUMENTS (NSSM) ==="
+$NssmExe = (Get-ChildItem C:\loki -Recurse -Filter nssm.exe -ErrorAction SilentlyContinue |
+           Where-Object { $_.FullName -match "\\win64\\" } |
+           Select-Object -First 1).FullName
+if (-not $NssmExe) { throw "NSSM not found under C:\loki" }
+
+& $NssmExe get Promtail AppDirectory
+& $NssmExe get Promtail AppParameters
+
+Write-Host "`n=== NETWORK TO LOKI ==="
+$LokiHost="jam-grafana-01"
+$LokiPort=3100
+Resolve-DnsName $LokiHost -ErrorAction Stop | Out-Null
+$tnc = Test-NetConnection -ComputerName $LokiHost -Port $LokiPort
+$tnc | Select-Object ComputerName, RemoteAddress, RemotePort, TcpTestSucceeded | Format-Table -AutoSize
+
+Write-Host "`n=== PROMTAIL LOG TAIL (STDERR/STDOUT) ==="
+$stderr="C:\loki\logs\promtail-stderr.log"
+$stdout="C:\loki\logs\promtail-stdout.log"
+if (Test-Path $stderr) { "`n--- stderr ---"; Get-Content $stderr -Tail 60 } else { "No stderr log found at $stderr" }
+if (Test-Path $stdout) { "`n--- stdout ---"; Get-Content $stdout -Tail 60 } else { "No stdout log found at $stdout" }
+
+Write-Host "`n=== SYSMON EVENT PROOF (LOCAL) ==="
+Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -MaxEvents 5 |
+  Select-Object TimeCreated, Id, ProviderName, Message |
+  Format-List
+
+Write-Host "`n=== GENERATE A FRESH EVENT ==="
+Start-Process notepad.exe
+Start-Sleep -Seconds 2
+Write-Host "Notepad launched. Refresh Grafana Explore with {job=`"windows-sysmon`"}"
