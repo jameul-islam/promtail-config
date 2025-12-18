@@ -1,0 +1,214 @@
+#Requires -RunAsAdministrator
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# ----------------------------
+# SETTINGS (edit if needed)
+# ----------------------------
+$Version = "3.6.3"
+
+# Standard endpoint root (you decided this - good choice)
+$Root    = "C:\loki"
+$BinDir  = Join-Path $Root "bin"
+$LogDir  = Join-Path $Root "logs"
+$ToolsDir= Join-Path $Root "tools"
+
+# Your Promtail config in GitHub (raw + fallback)
+$PromtailCfgUrlPrimary  = "https://raw.githubusercontent.com/jameul-islam/promtail-config/main/promtail-config.yaml"
+$PromtailCfgUrlFallback = "https://github.com/jameul-islam/promtail-config/raw/main/promtail-config.yaml"
+$PromtailCfgPath        = Join-Path $Root "promtail-config.yaml"
+
+# Loki destination sanity check (from your YAML)
+$LokiHost = "jam-grafana-01"
+$LokiPort = 3100
+
+# Downloads
+$PromtailZipUrl = "https://github.com/grafana/loki/releases/download/v$Version/promtail-windows-amd64.exe.zip"
+$SysmonZipUrl   = "https://download.sysinternals.com/files/Sysmon.zip"
+$SysmonCfgUrl1  = "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml"
+$SysmonCfgUrl2  = "https://github.com/SwiftOnSecurity/sysmon-config/raw/master/sysmonconfig-export.xml"
+$NssmZipUrl     = "https://nssm.cc/release/nssm-2.24.zip"
+
+# Temp paths
+$PromtailZip = Join-Path $Root "promtail.zip"
+$PromtailTmp = Join-Path $Root "promtail-tmp"
+
+$SysmonZip   = Join-Path $Root "sysmon.zip"
+$SysmonTmp   = Join-Path $Root "sysmon-tmp"
+$SysmonCfg   = Join-Path $Root "sysmonconfig.xml"
+
+$NssmZip     = Join-Path $Root "nssm.zip"
+$NssmTmp     = Join-Path $Root "nssm-tmp"
+
+# ----------------------------
+# HELPERS
+# ----------------------------
+function Ensure-Dir([string]$Path) {
+  if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $Path | Out-Null }
+}
+
+function Download-File([string]$Url, [string]$OutFile, [int]$Attempts = 6) {
+  $headers = @{
+    "User-Agent"    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    "Cache-Control" = "no-cache"
+    "Pragma"        = "no-cache"
+  }
+
+  for ($i = 1; $i -le $Attempts; $i++) {
+    try {
+      Write-Host "Downloading $Url"
+      Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -Headers $headers
+      if ((Test-Path $OutFile) -and ((Get-Item $OutFile).Length -gt 0)) { return }
+      throw "Downloaded file is empty."
+    }
+    catch {
+      if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
+      Write-Host "Attempt $i/$Attempts failed: $($_.Exception.Message)"
+      if ($i -eq $Attempts) { throw }
+      Start-Sleep -Seconds ([Math]::Min(10, 2 * $i))
+    }
+  }
+}
+
+function Assert-Zip([string]$Path) {
+  if (-not (Test-Path $Path)) { throw "ZIP missing: $Path" }
+  $fs = [System.IO.File]::OpenRead($Path)
+  try {
+    if ($fs.ReadByte() -ne 0x50 -or $fs.ReadByte() -ne 0x4B) {
+      throw "Not a ZIP (missing PK header): $Path"
+    }
+  } finally { $fs.Close() }
+}
+
+function Reset-Dir([string]$Path) {
+  if (Test-Path $Path) { Remove-Item $Path -Recurse -Force }
+  New-Item -ItemType Directory -Path $Path | Out-Null
+}
+
+# ----------------------------
+# PREP
+# ----------------------------
+Ensure-Dir $Root
+Ensure-Dir $BinDir
+Ensure-Dir $LogDir
+Ensure-Dir $ToolsDir
+
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+# ----------------------------
+# NETWORK SANITY (Loki reachable)
+# ----------------------------
+Write-Host "`n--- Checking Loki reachability ---"
+try { Resolve-DnsName $LokiHost -ErrorAction Stop | Out-Null } catch { throw "DNS failed for $LokiHost" }
+$tnc = Test-NetConnection -ComputerName $LokiHost -Port $LokiPort
+if (-not $tnc.TcpTestSucceeded) { throw "Cannot reach Loki at ${LokiHost}:${LokiPort} (TCP failed)" }
+
+# ----------------------------
+# INSTALL / UPDATE SYSMON + Swift config
+# ----------------------------
+Write-Host "`n--- Installing Sysmon + SwiftOnSecurity config ---"
+Download-File $SysmonZipUrl $SysmonZip
+Assert-Zip $SysmonZip
+Reset-Dir $SysmonTmp
+Expand-Archive -Path $SysmonZip -DestinationPath $SysmonTmp -Force
+
+$SysmonExe = Join-Path $SysmonTmp "Sysmon64.exe"
+if (-not (Test-Path $SysmonExe)) { throw "Sysmon64.exe not found after extraction." }
+
+# Download Sysmon config (try primary then fallback)
+try {
+  Download-File $SysmonCfgUrl1 $SysmonCfg
+} catch {
+  Write-Host "Primary Sysmon config URL failed; trying fallback..."
+  Download-File $SysmonCfgUrl2 $SysmonCfg
+}
+
+# Install or update Sysmon
+if (Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue) {
+  & $SysmonExe -c $SysmonCfg | Out-Null
+} else {
+  & $SysmonExe -accepteula -i $SysmonCfg | Out-Null
+}
+
+# Confirm Sysmon log exists
+try {
+  Get-WinEvent -ListLog "Microsoft-Windows-Sysmon/Operational" -ErrorAction Stop | Out-Null
+} catch {
+  throw "Sysmon event log not found after install. Sysmon may not have installed correctly."
+}
+
+# ----------------------------
+# INSTALL NSSM
+# ----------------------------
+Write-Host "`n--- Installing NSSM ---"
+Download-File $NssmZipUrl $NssmZip
+Assert-Zip $NssmZip
+Reset-Dir $NssmTmp
+Expand-Archive -Path $NssmZip -DestinationPath $NssmTmp -Force
+
+$NssmExe = (Get-ChildItem $NssmTmp -Recurse -Filter nssm.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\win64\\" } |
+            Select-Object -First 1).FullName
+if (-not $NssmExe) { throw "NSSM win64 exe not found after extraction." }
+
+# ----------------------------
+# INSTALL PROMTAIL
+# ----------------------------
+Write-Host "`n--- Installing Promtail ---"
+Download-File $PromtailZipUrl $PromtailZip
+Assert-Zip $PromtailZip
+Reset-Dir $PromtailTmp
+Expand-Archive -Path $PromtailZip -DestinationPath $PromtailTmp -Force
+
+$PromtailSrc = Get-ChildItem $PromtailTmp -Recurse -Filter "promtail-*.exe" | Select-Object -First 1
+if (-not $PromtailSrc) { throw "Promtail exe not found after extraction." }
+
+$PromtailExe = Join-Path $BinDir "promtail.exe"
+Copy-Item $PromtailSrc.FullName $PromtailExe -Force
+
+# ----------------------------
+# GET PROMTAIL CONFIG FROM YOUR GITHUB
+# ----------------------------
+Write-Host "`n--- Downloading Promtail config ---"
+try {
+  Download-File $PromtailCfgUrlPrimary $PromtailCfgPath
+} catch {
+  Write-Host "Primary Promtail config URL failed; trying fallback..."
+  Download-File $PromtailCfgUrlFallback $PromtailCfgPath
+}
+
+# ----------------------------
+# INSTALL / REINSTALL PROMTAIL SERVICE
+# ----------------------------
+Write-Host "`n--- Installing Promtail service ---"
+$ServiceName = "Promtail"
+
+if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+  & $NssmExe stop $ServiceName | Out-Null
+  & $NssmExe remove $ServiceName confirm | Out-Null
+}
+
+& $NssmExe install $ServiceName $PromtailExe | Out-Null
+& $NssmExe set $ServiceName AppDirectory $BinDir | Out-Null
+& $NssmExe set $ServiceName AppParameters "--config.file=`"$PromtailCfgPath`" --config.expand-env=true --log.level=info" | Out-Null
+& $NssmExe set $ServiceName Start SERVICE_AUTO_START | Out-Null
+& $NssmExe set $ServiceName AppStdout (Join-Path $LogDir "promtail-stdout.log") | Out-Null
+& $NssmExe set $ServiceName AppStderr (Join-Path $LogDir "promtail-stderr.log") | Out-Null
+
+Start-Service $ServiceName
+Start-Sleep -Seconds 3
+
+$svc = Get-Service $ServiceName
+$svc | Format-Table -AutoSize
+
+if ($svc.Status -ne "Running") {
+  Write-Host "`n--- Promtail stderr (tail) ---"
+  $err = Join-Path $LogDir "promtail-stderr.log"
+  if (Test-Path $err) { Get-Content $err -Tail 150 }
+  throw "Promtail did not stay running."
+}
+
+Write-Host "`n✅ Done."
+Write-Host "Promtail config: $PromtailCfgPath"
+Write-Host "Promtail logs:   $LogDir"
+Write-Host "Shipping to:     http://${LokiHost}:${LokiPort}"
